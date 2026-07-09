@@ -1,0 +1,15 @@
+# Git ignore untuk Hermes Agent
+
+# ─── Jangan pernah commit file dengan API key asli ─────────────
+.env
+*.env.local
+*.env.production
+
+# ─── clasp credentials ────────────────────────────────────────
+.clasprc.json
+
+# ─── OS & Editor artifacts ────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
