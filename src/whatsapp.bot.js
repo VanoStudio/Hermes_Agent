@@ -17,13 +17,23 @@ export async function initWhatsAppBot() {
   const store = new MongoStore({ mongoose: mongoose });
 
   const puppeteerConfig = {
-    args: ['--no-sandbox', '--disable-setuid-sandbox'] // Wajib untuk Docker/Railway
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process'
+    ]
   };
 
-  // Jika berjalan di Docker (Railway), gunakan path Chromium bawaan sistem
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
+  // Gunakan Chromium bawaan OS (diinstall via apt di Dockerfile)
+  // Fallback: cek ENV, lalu cek path default Debian
+  const chromiumPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
+  puppeteerConfig.executablePath = chromiumPath;
+  console.log(`[WhatsAppBot] Menggunakan Chromium di: ${chromiumPath}`);
 
   const client = new Client({
     authStrategy: new RemoteAuth({
