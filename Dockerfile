@@ -1,33 +1,44 @@
-# Menggunakan base image yang ringan dan aman
-FROM node:20-alpine AS builder
+# Menggunakan base image Debian-slim untuk kompatibilitas Chromium (Dibutuhkan whatsapp-web.js)
+FROM node:20-slim AS builder
 
-# Set working directory di dalam container
 WORKDIR /app
-
-# Menyalin file package.json dan package-lock.json (jika ada)
-# Hal ini memanfaatkan Docker cache agar npm install tidak dijalankan ulang jika dependensi tidak berubah
 COPY package*.json ./
+# Install dependencies
+RUN npm install
 
-# Menginstal dependensi produksi saja agar image lebih ringan
-RUN npm install --omit=dev
-
-# Menyalin seluruh source code ke dalam container
 COPY . .
 
-# Tahap produksi menggunakan image yang lebih bersih
-FROM node:20-alpine
+# Tahap produksi
+FROM node:20-slim
+
+# Install dependencies sistem untuk Puppeteer/Chromium
+# Ini krusial agar whatsapp-web.js bisa berjalan di Docker (Headless Chromium)
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    ca-certificates \
+    procps \
+    libxss1 \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm-dev \
+    libasound2 \
+    fonts-liberation \
+    libappindicator3-1 \
+    xdg-utils \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy dependensi dan source code dari tahap builder
+# Copy dependensi dan source code dari builder
 COPY --from=builder /app /app
 
-# Mengatur environment variable default
 ENV NODE_ENV=production
+# Force Puppeteer untuk menghindari sandbox errors di Docker
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
 
-# Expose port yang akan digunakan oleh aplikasi (Railway biasanya mendeteksi PORT otomatis)
 EXPOSE 3000
 
-# Entrypoint untuk menjalankan aplikasi
-# Pastikan 'npm start' sudah didefinisikan di package.json, atau ganti dengan 'node src/index.js'
-CMD ["npm", "start"]
+CMD ["node", "src/index.js"]
