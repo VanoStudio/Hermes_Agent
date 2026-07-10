@@ -13,10 +13,9 @@ COPY . .
 FROM node:20-slim
 
 # Install dependencies sistem untuk Puppeteer/Chromium
-# Ini krusial agar whatsapp-web.js bisa berjalan di Docker (Headless Chromium)
+# Termasuk 'chromium' agar kita menggunakan browser bawaan OS
 RUN apt-get update && apt-get install -y \
     wget \
-    chromium \
     gnupg \
     ca-certificates \
     procps \
@@ -29,6 +28,7 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     libappindicator3-1 \
     xdg-utils \
+    chromium \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
@@ -38,7 +38,8 @@ WORKDIR /app
 COPY --from=builder /app /app
 
 ENV NODE_ENV=production
-# Force Puppeteer untuk menghindari sandbox errors di Docker
+# Set path executable Chromium bawaan Debian agar Puppeteer langsung menggunakannya
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 

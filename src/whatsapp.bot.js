@@ -16,25 +16,22 @@ export async function initWhatsAppBot() {
   // Wwebjs-mongo membutuhkan koneksi mongoose yang sudah terbuka
   const store = new MongoStore({ mongoose: mongoose });
 
+  const puppeteerConfig = {
+    args: ['--no-sandbox', '--disable-setuid-sandbox'] // Wajib untuk Docker/Railway
+  };
+
+  // Jika berjalan di Docker (Railway), gunakan path Chromium bawaan sistem
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
   const client = new Client({
     authStrategy: new RemoteAuth({
-        store: store,
-        backupSyncIntervalMs: 300000
+      store: store,
+      backupSyncIntervalMs: 300000 // Sinkronisasi setiap 5 menit
     }),
-    // TAMBAHKAN BLOK PUPPETEER INI:
-    puppeteer: {
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process',
-            '--disable-gpu'
-        ]
-    }
-});
+    puppeteer: puppeteerConfig
+  });
 
   client.on('qr', (qr) => {
     console.log('\n[WhatsAppBot] KODE QR WHATSAPP DIBUTUHKAN!');
