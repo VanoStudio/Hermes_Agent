@@ -2,6 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { processMessageWithAI } from './ai.service.js';
 import { addCalendarEvent } from './google.service.js';
 import { getGlobalNews } from './news.service.js';
+import { getRecentHistory, saveMessage } from './conversation.service.js';
 
 export function initTelegramBot() {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -30,8 +31,11 @@ export function initTelegramBot() {
     try {
       bot.sendChatAction(chatId, 'typing');
 
+      // 0. Ambil riwayat percakapan supaya AI tidak "amnesia" tiap pesan
+      const history = await getRecentHistory(chatId);
+
       // 1. Dapatkan Tool Call JSON dari AI
-      const toolCall = await processMessageWithAI(text);
+      const toolCall = await processMessageWithAI(text, history);
       let finalResponse = toolCall.message;
 
       // 2. Eksekusi Tool (Aksi)
@@ -52,6 +56,10 @@ export function initTelegramBot() {
 
       // 3. Kirim Hasil
       bot.sendMessage(chatId, finalResponse, { parse_mode: 'Markdown' });
+
+      // 4. Simpan giliran percakapan ini supaya jadi konteks pesan berikutnya
+      await saveMessage(chatId, 'user', text);
+      await saveMessage(chatId, 'assistant', finalResponse);
 
     } catch (error) {
       console.error('[TelegramBot Error]', error.message);
