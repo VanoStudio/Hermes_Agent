@@ -4,35 +4,45 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
 // Model gratis di OpenRouter kadang kena rate-limit upstream dari provider-nya
 // (bukan limit akun kita) - jadi kita coba beberapa model unggulan berurutan,
-// bukan cuma satu. Kalau OPENROUTER_MODEL di-set di env, itu dicoba PALING
-// DULU, baru fallback ke daftar ini kalau gagal.
-const FALLBACK_MODELS = [
-  'openai/gpt-oss-120b:free',            // kuat reasoning + JSON terstruktur
-  'meta-llama/llama-3.3-70b-instruct:free', // stabil, umum dipakai
-  'qwen/qwen3-next-80b-a3b-instruct:free',  // alternatif kuat lainnya
-  'nvidia/nemotron-3-ultra-550b-a55b:free'  // cadangan terakhir, model besar
+// bukan cuma satu, DAN urutannya disesuaikan jenis permintaan (umum vs kode).
+const GENERAL_MODELS = [
+  'nvidia/nemotron-3-super-120b-a12b:free', // umum, reasoning kuat, context 1M
+  'poolside/laguna-m.1:free'                // alternatif umum lainnya
+];
+const CODING_MODELS = [
+  'cohere/north-mini-code:free' // dioptimalkan untuk kode - didahulukan kalau permintaan terdeteksi soal coding
 ];
 
-const MODEL_CANDIDATES = [
-  ...(process.env.OPENROUTER_MODEL ? [process.env.OPENROUTER_MODEL] : []),
-  ...FALLBACK_MODELS.filter((m) => m !== process.env.OPENROUTER_MODEL)
-];
+// Heuristik ringan: kalau pesan user mengandung kata kunci coding, dahulukan
+// model kode; kalau tidak, coba model umum dulu. Kedua daftar tetap saling
+// jadi fallback satu sama lain kalau salah satu kena rate-limit/timeout.
+const CODING_KEYWORDS = /\b(code|coding|script|html|css|javascript|js|python|json|api|function|program(?:kan)?|bug|error|debug|refactor|kode|fungsi)\b/i;
+
+function pickModelOrder(userMessage = '') {
+  const isCoding = CODING_KEYWORDS.test(userMessage);
+  const ordered = isCoding ? [...CODING_MODELS, ...GENERAL_MODELS] : [...GENERAL_MODELS, ...CODING_MODELS];
+  return [
+    ...(process.env.OPENROUTER_MODEL ? [process.env.OPENROUTER_MODEL] : []),
+    ...ordered.filter((m) => m !== process.env.OPENROUTER_MODEL)
+  ];
+}
 
 if (!OPENROUTER_API_KEY) {
   console.warn('[AIService] Peringatan: OPENROUTER_API_KEY tidak ditemukan.');
 }
 
 /**
- * Panggil OpenRouter, coba beberapa model berurutan (MODEL_CANDIDATES) kalau
- * ada yang kena rate-limit upstream (429) atau error sisi provider (5xx),
- * supaya satu model gratis lagi sibuk tidak langsung menggagalkan permintaan.
+ * Panggil OpenRouter, coba beberapa model berurutan kalau ada yang kena
+ * rate-limit upstream (429) atau error sisi provider (5xx), supaya satu
+ * model gratis lagi sibuk tidak langsung menggagalkan permintaan.
  * @param {Array<{role: string, content: string}>} messages
- * @param {{jsonMode?: boolean}} [opts]
+ * @param {{jsonMode?: boolean, hintText?: string}} [opts] hintText dipakai untuk memilih urutan model (mis. isi pesan user, untuk deteksi coding vs umum)
  * @returns {Promise<string>} Raw text dari respons AI.
  */
-async function callOpenRouterWithFallback(messages, { jsonMode = true } = {}) {
+async function callOpenRouterWithFallback(messages, { jsonMode = true, hintText = '' } = {}) {
+  const modelCandidates = pickModelOrder(hintText);
   let lastError;
-  for (const model of MODEL_CANDIDATES) {
+  for (const model of modelCandidates) {
     try {
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
@@ -72,7 +82,7 @@ function buildSystemPrompt(profile = {}) {
       notes.map((n) => `- ${n}`).join('\n')
     : `\nKamu belum tahu nama panggilan orang ini. Kalau relevan/natural, boleh tanya mau dipanggil apa - tapi jangan maksa di setiap pesan.`;
 
-  return `Kamu adalah asisten AI pribadi. Untuk orang yang sedang mengobrol denganmu SEKARANG, namamu adalah "${myName}" - begitulah dia memanggilmu dan begitulah kamu memperkenalkan dirimu ke dia. Gaya bicaramu cerdas, hangat, dan enak diajak ngobrol - natural dan membumi, bukan kaku atau template. Waktu saat ini: ${new Date().toISOString()}.
+  return `Kamu adalah asisten AI pribadi. Untuk orang yang sedang mengobrol denganmu SEKARANG, namamu adalah "${myName}" - begitulah dia memanggilmu dan begitulah kamu memperkenalkan dirimu ke dia. Gaya bicaramu cerdas, hangat, dan enak diajak ngobrol - natural dan membumi, bukan kaku atau template. SELALU balas dalam Bahasa Indonesia, kecuali user jelas-jelas menulis dalam bahasa lain. Waktu saat ini: ${new Date().toISOString()}.
 
 Kamu dipakai oleh BANYAK ORANG BERBEDA (bukan cuma satu user). Setiap orang punya profil & riwayat sendiri-sendiri yang terpisah dari orang lain - jangan pernah bocorkan atau campur informasi antar orang. Nama panggilanmu ("${myName}") juga BISA BEDA untuk tiap orang - orang lain mungkin memanggilmu dengan nama lain, itu normal.
 ${profileBlock}
@@ -116,7 +126,7 @@ export async function processMessageWithAI(userMessage, history = [], profile = 
     ...history,
     { role: 'user', content: userMessage }
   ];
-  const rawText = await callOpenRouterWithFallback(messages, { jsonMode: true });
+  const rawText = await callOpenRouterWithFallback(messages, { jsonMode: true, hintText: userMessage });
   return parseToolCall(rawText);
 }
 

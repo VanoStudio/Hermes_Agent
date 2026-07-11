@@ -1,6 +1,6 @@
 import Parser from 'rss-parser';
 import axios from 'axios';
-import { JSDOM } from 'jsdom';
+import { JSDOM, VirtualConsole } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 
 const parser = new Parser();
@@ -9,6 +9,13 @@ const parser = new Parser();
 // 2-3 paragraf yang akurat, tapi tidak membengkakkan prompt tanpa perlu.
 const MAX_ARTICLE_CHARS = 4000;
 const ARTICLE_FETCH_TIMEOUT_MS = 8000;
+
+// jsdom suka mencetak warning "Could not parse CSS stylesheet" saat parsing
+// halaman berita modern (CSS-in-JS, dsb) - jinak/tidak fatal (ekstraksi teks
+// tetap jalan), tapi berisik di log Railway. VirtualConsole kosong (tidak
+// disambungkan ke console) meredamnya tanpa menyembunyikan error asli, karena
+// kegagalan fetch/parse tetap ditangani lewat try/catch di bawah.
+const silentVirtualConsole = new VirtualConsole();
 
 /**
  * Ambil isi teks penuh sebuah artikel berita (bukan cuma cuplikan RSS),
@@ -25,7 +32,7 @@ export async function fetchArticleFullText(url) {
       timeout: ARTICLE_FETCH_TIMEOUT_MS,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
-    const dom = new JSDOM(res.data, { url });
+    const dom = new JSDOM(res.data, { url, virtualConsole: silentVirtualConsole });
     const article = new Readability(dom.window.document).parse();
     const text = article?.textContent?.trim();
     if (!text) return null;
