@@ -5,6 +5,8 @@ import mongoose from 'mongoose';
 import qrcode from 'qrcode-terminal';
 import cron from 'node-cron';
 import { getAINews } from './news.service.js';
+import { setQr, setStatus } from './qr.state.js';
+import { logEvent } from './logger.service.js';
 
 export async function initWhatsAppBot() {
   const MONGODB_URI = process.env.MONGODB_URI;
@@ -24,8 +26,9 @@ export async function initWhatsAppBot() {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--no-first-run',
-      '--no-zygote',
-      '--single-process'
+      '--no-zygote'
+      // NOTE: '--single-process' sengaja dihapus - flag ini sering menyebabkan
+      // Chromium crash di container Railway sebelum event 'qr' sempat muncul.
     ]
   };
 
@@ -44,17 +47,34 @@ export async function initWhatsAppBot() {
   });
 
   client.on('qr', (qr) => {
-    console.log('\n[WhatsAppBot] KODE QR WHATSAPP DIBUTUHKAN!');
-    console.log('Tolong scan kode QR di bawah ini dalam waktu 30 detik:\n');
+    setQr(qr);
+    logEvent('whatsapp', 'qr', 'QR code baru digenerate. Buka endpoint /qr di URL Railway untuk scan.');
+    // Fallback ASCII di console, berguna saat development lokal.
     qrcode.generate(qr, { small: true });
   });
 
+  client.on('authenticated', () => {
+    setStatus('authenticated');
+    logEvent('whatsapp', 'authenticated', 'Autentikasi berhasil, menunggu client siap.');
+  });
+
+  client.on('auth_failure', (msg) => {
+    setStatus('auth_failure');
+    logEvent('whatsapp', 'auth_failure', msg, 'error');
+  });
+
+  client.on('disconnected', (reason) => {
+    setStatus('disconnected');
+    logEvent('whatsapp', 'disconnected', reason, 'warn');
+  });
+
   client.on('remote_session_saved', () => {
-    console.log('[WhatsAppBot] Sesi telah diamankan di MongoDB (RemoteAuth).');
+    logEvent('whatsapp', 'remote_session_saved', 'Sesi telah diamankan di MongoDB (RemoteAuth).');
   });
 
   client.on('ready', async () => {
-    console.log('Bot WhatsApp berhasil terhubung!');
+    setStatus('ready');
+    logEvent('whatsapp', 'ready', 'Bot WhatsApp berhasil terhubung!');
 
     // --- KODE PENCARI ID GRUP (SEMENTARA) ---
     try {

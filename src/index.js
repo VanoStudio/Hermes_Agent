@@ -2,12 +2,17 @@ import 'dotenv/config';
 import mongoose from 'mongoose';
 import { initTelegramBot } from './telegram.bot.js';
 import { initWhatsAppBot } from './whatsapp.bot.js';
+import { startServer } from './server.js';
 
 console.log('=============================================');
 console.log('🚀 Hermes Agent - Dual Bot is booting up');
 console.log('=============================================');
 
 async function bootstrap() {
+  // Jalankan server HTTP terlebih dahulu (untuk /qr, /status, /logs, /health)
+  // agar tetap bisa diakses walau MongoDB/WhatsApp belum siap.
+  startServer();
+
   const MONGODB_URI = process.env.MONGODB_URI;
 
   if (!MONGODB_URI) {

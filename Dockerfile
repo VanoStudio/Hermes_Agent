@@ -44,4 +44,7 @@ ENV NODE_ENV=production
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
+# Port HTTP server (QR image, status, logs). Railway akan meng-inject PORT-nya sendiri.
+EXPOSE 3000
+
 CMD ["node", "src/index.js"]
