@@ -31,15 +31,21 @@ if (!OPENROUTER_API_KEY) {
   console.warn('[AIService] Peringatan: OPENROUTER_API_KEY tidak ditemukan.');
 }
 
+const MODEL_TIMEOUT_MS = 20000; // model yang macet/lambat cepat gagal & pindah ke fallback, bukan menggantung tanpa batas
+
 /**
  * Panggil OpenRouter, coba beberapa model berurutan kalau ada yang kena
- * rate-limit upstream (429) atau error sisi provider (5xx), supaya satu
- * model gratis lagi sibuk tidak langsung menggagalkan permintaan.
+ * rate-limit upstream (429), error sisi provider (5xx), timeout, atau
+ * lolos tapi hasilnya tidak valid (lihat `validate`) - supaya satu model
+ * gratis lagi sibuk/rusak tidak langsung menggagalkan permintaan.
  * @param {Array<{role: string, content: string}>} messages
- * @param {{jsonMode?: boolean, hintText?: string}} [opts] hintText dipakai untuk memilih urutan model (mis. isi pesan user, untuk deteksi coding vs umum)
+ * @param {{jsonMode?: boolean, hintText?: string, validate?: (rawText: string) => boolean}} [opts]
+ *   hintText dipakai untuk memilih urutan model (deteksi coding vs umum).
+ *   validate: kalau disediakan dan return false, respons dianggap gagal dan lanjut ke model berikutnya
+ *   (mis. JSON valid tapi field "message" kosong - jangan diloloskan begitu saja ke user).
  * @returns {Promise<string>} Raw text dari respons AI.
  */
-async function callOpenRouterWithFallback(messages, { jsonMode = true, hintText = '' } = {}) {
+async function callOpenRouterWithFallback(messages, { jsonMode = true, hintText = '', validate } = {}) {
   const modelCandidates = pickModelOrder(hintText);
   let lastError;
   for (const model of modelCandidates) {
@@ -52,6 +58,7 @@ async function callOpenRouterWithFallback(messages, { jsonMode = true, hintText 
           ...(jsonMode ? { response_format: { type: 'json_object' } } : {})
         },
         {
+          timeout: MODEL_TIMEOUT_MS,
           headers: {
             'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
             'Content-Type': 'application/json',
@@ -60,13 +67,18 @@ async function callOpenRouterWithFallback(messages, { jsonMode = true, hintText 
           }
         }
       );
-      return response.data.choices[0].message.content;
+      const rawText = response.data.choices[0].message.content;
+      if (validate && !validate(rawText)) {
+        throw new Error('Respons model tidak valid/lengkap');
+      }
+      return rawText;
     } catch (error) {
       lastError = error;
       const status = error.response?.status;
-      const retryable = status === 429 || (status >= 500 && status < 600);
-      console.error(`[AIService] Model "${model}" gagal (status ${status}):`, error.response?.data?.error?.message || error.message);
-      if (!retryable) break; // error bukan soal ketersediaan model (mis. API key salah) -> jangan coba model lain
+      // Tanpa status = network error, timeout, ATAU validasi kita sendiri gagal - semuanya layak dicoba model lain.
+      const retryable = !status || status === 429 || (status >= 500 && status < 600);
+      console.error(`[AIService] Model "${model}" gagal (status ${status ?? 'n/a'}):`, error.response?.data?.error?.message || error.message);
+      if (!retryable) break; // error bukan soal ketersediaan/kualitas model (mis. API key salah) -> jangan coba model lain
     }
   }
   throw new Error('Gagal menghubungi otak AI (semua model OpenRouter gagal): ' + (lastError?.message || 'unknown'));
@@ -126,7 +138,22 @@ export async function processMessageWithAI(userMessage, history = [], profile = 
     ...history,
     { role: 'user', content: userMessage }
   ];
-  const rawText = await callOpenRouterWithFallback(messages, { jsonMode: true, hintText: userMessage });
+  const rawText = await callOpenRouterWithFallback(messages, {
+    jsonMode: true,
+    hintText: userMessage,
+    // Tolak respons yang JSON-nya valid tapi field "message"-nya kosong -
+    // ini yang sebelumnya bocor sebagai balasan literal "Memproses..." ke
+    // user. Kalau tidak valid, otomatis lanjut coba model fallback berikutnya.
+    validate: (text) => {
+      try {
+        const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        const parsed = JSON.parse(cleaned);
+        return typeof parsed.message === 'string' && parsed.message.trim().length > 0;
+      } catch {
+        return false;
+      }
+    }
+  });
   return parseToolCall(rawText);
 }
 
@@ -184,7 +211,9 @@ function parseToolCall(rawText) {
     return {
       action: parsed.action || 'reply',
       params: parsed.params || {},
-      message: parsed.message || 'Memproses...',
+      // Jaring pengaman terakhir (harusnya tidak pernah kena kalau lewat
+      // processMessageWithAI - itu sudah divalidasi di callOpenRouterWithFallback).
+      message: parsed.message || 'Maaf, aku belum dapat jawaban yang jelas untuk itu. Bisa coba dijelaskan ulang?',
       profileUpdate
     };
   } catch (e) {

@@ -17,15 +17,22 @@ export async function getProfile(userId) {
 }
 
 /**
- * Pastikan dokumen profil ada & username Telegram-nya up to date.
- * Dipanggil tiap pesan masuk supaya profil selalu tercatat sejak interaksi pertama.
+ * Pastikan dokumen profil ada & username Telegram-nya up to date, SEKALIGUS
+ * kembalikan profil terkini - digabung jadi satu round-trip Mongo (bukan
+ * ensureProfile lalu getProfile terpisah) supaya tiap pesan masuk lebih cepat.
+ * @returns {Promise<{nickname: string|null, assistantName: string|null, notes: string[]}>}
  */
 export async function ensureProfile(userId, telegramUsername) {
-  await UserProfile.updateOne(
+  const doc = await UserProfile.findOneAndUpdate(
     { _id: String(userId) },
     { $set: { telegramUsername: telegramUsername || null, updatedAt: new Date() }, $setOnInsert: { _id: String(userId) } },
-    { upsert: true }
+    { upsert: true, new: true }
   );
+  return {
+    nickname: doc?.nickname || null,
+    assistantName: doc?.assistantName || null,
+    notes: doc?.notes || []
+  };
 }
 
 /**

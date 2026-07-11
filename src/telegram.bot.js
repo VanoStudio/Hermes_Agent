@@ -4,9 +4,10 @@ import { processMessageWithAI, summarizeNewsArticles } from './ai.service.js';
 import { addCalendarEvent } from './google.service.js';
 import { getGlobalNews, attachFullText } from './news.service.js';
 import { getRecentHistory, saveMessage } from './conversation.service.js';
-import { getProfile, ensureProfile, setNickname, setAssistantName, addNote } from './user.service.js';
+import { ensureProfile, setNickname, setAssistantName, addNote } from './user.service.js';
 import { UserProfile } from './user.model.js';
 import { sendLongTelegramMessage } from './message.util.js';
+import { startTypingLoop, sendStatusMessage } from './status.util.js';
 import { logEvent } from './logger.service.js';
 
 const DAILY_NEWS_COUNT = 5;
@@ -33,40 +34,47 @@ export function initTelegramBot() {
 
     if (!text) return;
 
-    await ensureProfile(userId, msg.from.username || null);
+    // Ambil profil (nickname, nama AI, dll) + pastikan tercatat - satu round-trip Mongo.
+    const profile = await ensureProfile(userId, msg.from.username || null);
 
     if (text.startsWith('/start')) {
-      const profile = await getProfile(userId);
       const greetName = profile.nickname || username;
       const aiName = profile.assistantName || 'Hermes';
       bot.sendMessage(chatId, `Halo ${greetName}! Saya ${aiName}, AI assistant Anda. Ada yang bisa saya bantu?`);
       return;
     }
 
-    try {
-      bot.sendChatAction(chatId, 'typing');
+    const aiName = profile.assistantName || 'Hermes';
 
-      // 0. Ambil profil permanen (nickname, nama AI, dll) + riwayat percakapan -
-      // keduanya dikunci per userId, jadi tiap orang punya "otak" sendiri-sendiri.
-      const profile = await getProfile(userId);
+    // Jaga indikator "mengetik..." tetap hidup + kasih status sementara,
+    // supaya user tahu bot masih bekerja walau prosesnya agak lama
+    // (bukan diam seperti macet).
+    const stopTyping = startTypingLoop(bot, chatId);
+    const status = await sendStatusMessage(bot, chatId, `🧠 ${aiName} sedang mikir...`);
+
+    try {
+      // 0. Riwayat percakapan - dikunci per userId, jadi tiap orang punya "otak" sendiri-sendiri.
       const history = await getRecentHistory(userId);
 
       // 1. Dapatkan Tool Call JSON dari AI
       const toolCall = await processMessageWithAI(text, history, profile);
       let finalResponse = toolCall.message;
 
-      // 2. Eksekusi Tool (Aksi)
+      // 2. Eksekusi Tool (Aksi) - untuk tugas berat (berita), kasih update bertahap
       switch (toolCall.action) {
         case 'calendar':
+          await status.update('📅 Menyimpan ke Google Calendar...');
           finalResponse = await addCalendarEvent(toolCall.params);
           break;
         case 'news': {
-          finalResponse = await buildGlobalNewsDigest(DAILY_NEWS_COUNT);
+          finalResponse = await buildGlobalNewsDigest(DAILY_NEWS_COUNT, status);
           break;
         }
       }
 
-      // 3. Kirim Hasil (dipecah otomatis kalau kepanjangan buat Telegram)
+      // 3. Hapus status sementara, baru kirim hasil final (dipecah otomatis kalau kepanjangan)
+      await status.remove();
+      stopTyping();
       await sendLongTelegramMessage(bot, chatId, finalResponse);
 
       // 4. Simpan giliran percakapan ini supaya jadi konteks pesan berikutnya
@@ -87,6 +95,8 @@ export function initTelegramBot() {
 
     } catch (error) {
       console.error('[TelegramBot Error]', error.message);
+      await status.remove();
+      stopTyping();
       bot.sendMessage(chatId, '⚠️ Terjadi kesalahan internal saat memproses pesan Anda.');
     }
   });
@@ -101,14 +111,20 @@ export function initTelegramBot() {
  * berdasarkan isi artikel penuh. Dipakai untuk permintaan on-demand maupun
  * broadcast harian, supaya hasilnya konsisten substantif.
  * @param {number} count
+ * @param {{update: (text: string) => Promise<void>}} [status] opsional - kasih update progres bertahap ke chat (dilewatkan saat dipanggil dari cron, tanpa chat interaktif)
  * @returns {Promise<string>}
  */
-async function buildGlobalNewsDigest(count) {
+async function buildGlobalNewsDigest(count, status) {
+  await status?.update('📡 Mengambil berita terbaru...');
   const newsList = await getGlobalNews(count);
   if (newsList.length === 0) {
     return '⚠️ Gagal mengambil berita saat ini. Silakan coba lagi nanti.';
   }
+
+  await status?.update('📖 Membaca isi artikel...');
   const enriched = await attachFullText(newsList);
+
+  await status?.update('🧠 Meringkas dengan AI, sedikit lagi...');
   const header = `📰 *Ringkasan ${enriched.length} Berita Global Teratas*\n\n`;
   const body = await summarizeNewsArticles(enriched);
   return header + body;
