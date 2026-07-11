@@ -8,6 +8,7 @@ import { getAINews } from './news.service.js';
 import { setQr, setStatus } from './qr.state.js';
 import { logEvent } from './logger.service.js';
 import { setClient } from './wa.state.js';
+import { Group } from './group.model.js';
 
 export async function initWhatsAppBot() {
   const MONGODB_URI = process.env.MONGODB_URI;
@@ -102,18 +103,36 @@ export async function initWhatsAppBot() {
     // tepat setelah reconnect). Ambil kapan saja lewat endpoint GET /groups.
   });
 
-  // Jalur PALING andal untuk dapat ID grup, bahkan saat browser lagi berat:
-  // ketik "!groupinfo" di grup target, bot balas ID-nya. Pakai 'message_create'
-  // (bukan cuma 'message') supaya pesan yang KITA kirim sendiri dari HP juga
-  // ketangkap - jadi tidak perlu minta orang lain yang mengetik.
+  // Tangkap grup secara PASIF dari setiap pesan grup dan simpan ke MongoDB.
+  // Pola ini jauh lebih andal daripada scan browser (getChats/evaluate massal)
+  // yang gampang timeout di Railway: kita cuma menumpang event yang memang
+  // sudah dikirim WA Web saat halaman sempat, tanpa memaksa scan saat sibuk.
+  // msg.from sudah berisi JID grup secara gratis (tanpa panggilan ke browser).
   client.on('message_create', async msg => {
-    if (msg.body === '!groupinfo' && msg.from.endsWith('@g.us')) {
+    const from = msg.from;
+    if (!from || !from.endsWith('@g.us')) return;
+
+    // Balasan on-demand: ketik "!groupinfo" di grup target -> bot balas ID-nya.
+    if (msg.body === '!groupinfo') {
       try {
-        await msg.reply(`ID Grup ini: ${msg.from}`);
-        logEvent('whatsapp', 'groupinfo', `Group ID diminta: ${msg.from}`);
+        await msg.reply(`ID Grup ini: ${from}`);
       } catch (err) {
         logEvent('whatsapp', 'groupinfo', 'Gagal balas !groupinfo: ' + err.message, 'warn');
       }
+    }
+
+    try {
+      // Simpan ID dulu (dijamin ada). Nama diisi best-effort lewat pembacaan
+      // SATU chat saja (bukan scan semua) dan tanpa menyentuh groupMetadata.
+      let name = await getGroupNameLight(client, from);
+      await Group.updateOne(
+        { _id: from },
+        { $set: { updatedAt: new Date(), ...(name ? { name } : {}) }, $setOnInsert: { _id: from } },
+        { upsert: true }
+      );
+    } catch (err) {
+      // Jangan sampai gagal simpan grup mengganggu alur pesan lain.
+      logEvent('whatsapp', 'group_upsert', 'Gagal simpan grup: ' + err.message, 'warn');
     }
   });
 
@@ -122,6 +141,37 @@ export async function initWhatsAppBot() {
   console.log('[WhatsAppBot] Memulai inisialisasi Client...');
   await client.initialize();
   return client;
+}
+
+/**
+ * Membaca nama SATU grup langsung dari Store WhatsApp Web (bukan scan semua chat),
+ * tanpa menyentuh groupMetadata (yang lazy & memicu request jaringan berat).
+ * Dibungkus race timeout pendek supaya kalau halaman lagi sibuk, kita tidak
+ * menggantung - cukup kembalikan null dan pakai ID saja.
+ * @param {import('whatsapp-web.js').Client} client
+ * @param {string} groupId JID grup, contoh: xxxx@g.us
+ * @returns {Promise<string|null>}
+ */
+async function getGroupNameLight(client, groupId) {
+  if (!client.pupPage) return null;
+  try {
+    return await Promise.race([
+      client.pupPage.evaluate((gid) => {
+        try {
+          const Store = window.require('WAWebCollections');
+          const wid = window.require('WAWebWidFactory').createWid(gid);
+          const chat = Store.Chat.get(wid);
+          if (!chat) return null;
+          return chat.formattedTitle || chat.name || null;
+        } catch (e) {
+          return null;
+        }
+      }, groupId),
+      new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+    ]);
+  } catch (e) {
+    return null;
+  }
 }
 
 /**

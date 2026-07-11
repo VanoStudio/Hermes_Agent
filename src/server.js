@@ -3,6 +3,7 @@ import QRCode from 'qrcode';
 import { getState } from './qr.state.js';
 import { Log } from './log.model.js';
 import { getClient } from './wa.state.js';
+import { Group } from './group.model.js';
 
 export function startServer() {
   const app = express();
@@ -51,43 +52,30 @@ export function startServer() {
     }
   });
 
+  // Daftar grup dibaca dari MongoDB (registry yang diisi pasif dari event pesan).
+  // Ini INSTAN dan tidak pernah menyentuh browser, jadi tidak bisa timeout.
+  // Grup akan muncul di sini begitu ada aktivitas pesan di grup tersebut,
+  // atau setelah kamu ketik "!groupinfo" di grup itu.
   app.get('/groups', async (req, res) => {
-    const client = getClient();
-    const { status } = getState();
-
-    if (!client || status !== 'ready') {
-      return res.status(503).json({ error: `Bot belum siap (status: ${status}). Coba lagi setelah status "ready".` });
-    }
-
     try {
-      // Sengaja TIDAK pakai client.getChats() maupun mengakses chat.groupMetadata.
-      // chat.groupMetadata adalah LAZY GETTER - begitu diakses, WhatsApp Web
-      // memicu request metadata live ke server untuk tiap grup, itulah yang bikin
-      // timeout di CPU terbatas Railway. Untuk sekadar nama + ID, kita cukup cek
-      // ID-nya (grup = server 'g.us') tanpa menyentuh metadata sama sekali -> instan.
-      const groups = await Promise.race([
-        client.pupPage.evaluate(() => {
-          const chats = window.require('WAWebCollections').Chat.getModelsArray();
-          const out = [];
-          for (const c of chats) {
-            try {
-              const id = c.id;
-              const isGroup =
-                (typeof id?.isGroup === 'function' ? id.isGroup() : id?.server === 'g.us');
-              if (!isGroup) continue;
-              let name = '';
-              try { name = c.formattedTitle || c.name || ''; } catch (e) { /* getter error, abaikan */ }
-              out.push({ name: name || id.user || id._serialized, id: id._serialized });
-            } catch (e) { /* lewati chat bermasalah */ }
-          }
-          return out;
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout saat membaca Store WhatsApp Web')), 30000))
-      ]);
+      let liveScan = 'skipped';
 
-      res.json({ count: groups.length, groups });
+      // Opsional: /groups?refresh=1 mencoba scan penuh dari browser (best-effort).
+      // Kalau browser lagi sibuk dan timeout, kita tetap balas isi Mongo - tidak error.
+      if (req.query.refresh === '1') {
+        liveScan = await refreshGroupsFromBrowser();
+      }
+
+      const docs = await Group.find().sort({ name: 1, _id: 1 });
+      const groups = docs.map((g) => ({ name: g.name || '(tanpa nama)', id: g._id }));
+      res.json({
+        count: groups.length,
+        liveScan,
+        hint: 'Grup muncul setelah ada aktivitas pesan / setelah ketik "!groupinfo" di grup itu. Tambahkan ?refresh=1 untuk mencoba scan penuh.',
+        groups
+      });
     } catch (err) {
-      res.status(500).json({ error: 'Gagal mengambil daftar grup: ' + err.message });
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -103,4 +91,54 @@ export function startServer() {
   app.listen(PORT, () => {
     console.log(`[Server] HTTP server listening on port ${PORT}`);
   });
+}
+
+/**
+ * Best-effort: coba scan semua grup langsung dari Store WhatsApp Web dan
+ * simpan ke Mongo. Filter grup hanya lewat cek ID (server 'g.us'), TIDAK
+ * menyentuh groupMetadata. Dibungkus race timeout supaya kalau browser sibuk
+ * kita menyerah dengan rapi ('timeout') alih-alih menggantung/menggagalkan request.
+ * @returns {Promise<'ok'|'timeout'|'not_ready'|'error'>}
+ */
+async function refreshGroupsFromBrowser() {
+  const client = getClient();
+  const { status } = getState();
+  if (!client || !client.pupPage || status !== 'ready') return 'not_ready';
+
+  try {
+    const scanned = await Promise.race([
+      client.pupPage.evaluate(() => {
+        const chats = window.require('WAWebCollections').Chat.getModelsArray();
+        const out = [];
+        for (const c of chats) {
+          try {
+            const id = c.id;
+            const isGroup =
+              (typeof id?.isGroup === 'function' ? id.isGroup() : id?.server === 'g.us');
+            if (!isGroup) continue;
+            let name = '';
+            try { name = c.formattedTitle || c.name || ''; } catch (e) { /* abaikan */ }
+            out.push({ id: id._serialized, name });
+          } catch (e) { /* lewati */ }
+        }
+        return out;
+      }),
+      new Promise((resolve) => setTimeout(() => resolve(null), 20000))
+    ]);
+
+    if (!scanned) return 'timeout';
+
+    await Promise.all(
+      scanned.map((g) =>
+        Group.updateOne(
+          { _id: g.id },
+          { $set: { updatedAt: new Date(), ...(g.name ? { name: g.name } : {}) }, $setOnInsert: { _id: g.id } },
+          { upsert: true }
+        )
+      )
+    );
+    return 'ok';
+  } catch (e) {
+    return 'error';
+  }
 }
