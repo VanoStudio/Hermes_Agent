@@ -2,6 +2,7 @@ import express from 'express';
 import QRCode from 'qrcode';
 import { getState } from './qr.state.js';
 import { Log } from './log.model.js';
+import { getClient } from './wa.state.js';
 
 export function startServer() {
   const app = express();
@@ -47,6 +48,25 @@ export function startServer() {
       `);
     } catch (err) {
       res.status(500).send('Gagal generate QR image: ' + err.message);
+    }
+  });
+
+  app.get('/groups', async (req, res) => {
+    const client = getClient();
+    const { status } = getState();
+
+    if (!client || status !== 'ready') {
+      return res.status(503).json({ error: `Bot belum siap (status: ${status}). Coba lagi setelah status "ready".` });
+    }
+
+    try {
+      const chats = await client.getChats();
+      const groups = chats
+        .filter((chat) => chat.isGroup)
+        .map((chat) => ({ name: chat.name, id: chat.id._serialized }));
+      res.json({ count: groups.length, groups });
+    } catch (err) {
+      res.status(500).json({ error: 'Gagal mengambil daftar grup: ' + err.message });
     }
   });
 

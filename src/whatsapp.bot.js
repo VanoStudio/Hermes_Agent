@@ -7,6 +7,7 @@ import cron from 'node-cron';
 import { getAINews } from './news.service.js';
 import { setQr, setStatus } from './qr.state.js';
 import { logEvent } from './logger.service.js';
+import { setClient } from './wa.state.js';
 
 export async function initWhatsAppBot() {
   const MONGODB_URI = process.env.MONGODB_URI;
@@ -45,6 +46,9 @@ export async function initWhatsAppBot() {
   // Fallback: cek ENV, lalu cek path default Debian
   const chromiumPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
   puppeteerConfig.executablePath = chromiumPath;
+  // Naikkan batas waktu protokol CDP (default Puppeteer bisa kepotong duluan
+  // di CPU Railway yang terbatas, terutama saat evaluate berat seperti getChats()).
+  puppeteerConfig.protocolTimeout = 180000; // 3 menit
   console.log(`[WhatsAppBot] Menggunakan Chromium di: ${chromiumPath}`);
 
   const client = new Client({
@@ -94,28 +98,9 @@ export async function initWhatsAppBot() {
   client.on('ready', async () => {
     setStatus('ready');
     logEvent('whatsapp', 'ready', 'Bot WhatsApp berhasil terhubung!');
-
-    // --- KODE PENCARI ID GRUP (SEMENTARA) ---
-    try {
-        console.log('Mencari daftar grup...');
-        const chats = await client.getChats();
-        
-        // Memfilter agar hanya menampilkan obrolan grup
-        const groups = chats.filter(chat => chat.isGroup);
-        
-        console.log('\n=== DAFTAR ID GRUP WHATSAPP ===');
-        groups.forEach((group, index) => {
-            console.log(`${index + 1}. Nama Grup: "${group.name}"`);
-            console.log(`   ID Grup  : ${group.id._serialized}`);
-            console.log('-------------------------------');
-        });
-        console.log('===============================\n');
-        
-    } catch (error) {
-        console.error('Gagal mengambil daftar grup:', error);
-    }
-    // --- AKHIR KODE PENCARI ID GRUP ---
-});
+    // Daftar grup tidak lagi di-fetch otomatis di sini (berat & rawan timeout
+    // tepat setelah reconnect). Ambil kapan saja lewat endpoint GET /groups.
+  });
 
   // Listener kecil untuk mengetahui ID saat diinvite ke grup baru
   client.on('message', async msg => {
@@ -123,6 +108,8 @@ export async function initWhatsAppBot() {
       msg.reply(`ID Grup ini: ${msg.from}`);
     }
   });
+
+  setClient(client);
 
   console.log('[WhatsAppBot] Memulai inisialisasi Client...');
   await client.initialize();
