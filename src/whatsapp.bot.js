@@ -103,12 +103,20 @@ export async function initWhatsAppBot() {
     // tepat setelah reconnect). Ambil kapan saja lewat endpoint GET /groups.
   });
 
-  // Tangkap grup secara PASIF dari setiap pesan grup dan simpan ke MongoDB.
-  // Pola ini jauh lebih andal daripada scan browser (getChats/evaluate massal)
-  // yang gampang timeout di Railway: kita cuma menumpang event yang memang
-  // sudah dikirim WA Web saat halaman sempat, tanpa memaksa scan saat sibuk.
-  // msg.from sudah berisi JID grup secara gratis (tanpa panggilan ke browser).
-  client.on('message_create', async msg => {
+  // Handler pesan: pakai untuk (1) diagnostik pipeline event, (2) balas
+  // !groupinfo, (3) tangkap grup pasif ke Mongo. Dipasang ke DUA event:
+  // 'message_create' (termasuk pesan kita sendiri) dan 'message' (dari orang
+  // lain) supaya penangkapan grup tetap jalan dari sisi mana pun.
+  let msgPipelineLogged = false;
+  const handleMessage = async (msg) => {
+    // DIAGNOSTIK: catat sekali saja saat event pesan PERTAMA tiba. Kalau entri
+    // ini tidak pernah muncul di /logs, berarti halaman WA Web tidak mengirim
+    // event pesan sama sekali (bot tidak benar-benar menerima pesan).
+    if (!msgPipelineLogged) {
+      msgPipelineLogged = true;
+      logEvent('whatsapp', 'msg_pipeline', `Event pesan pertama diterima (from=${msg.from}, fromMe=${msg.fromMe})`);
+    }
+
     const from = msg.from;
     if (!from || !from.endsWith('@g.us')) return;
 
@@ -116,6 +124,7 @@ export async function initWhatsAppBot() {
     if (msg.body === '!groupinfo') {
       try {
         await msg.reply(`ID Grup ini: ${from}`);
+        logEvent('whatsapp', 'groupinfo', `Balas !groupinfo untuk ${from}`);
       } catch (err) {
         logEvent('whatsapp', 'groupinfo', 'Gagal balas !groupinfo: ' + err.message, 'warn');
       }
@@ -124,17 +133,20 @@ export async function initWhatsAppBot() {
     try {
       // Simpan ID dulu (dijamin ada). Nama diisi best-effort lewat pembacaan
       // SATU chat saja (bukan scan semua) dan tanpa menyentuh groupMetadata.
-      let name = await getGroupNameLight(client, from);
+      const name = await getGroupNameLight(client, from);
       await Group.updateOne(
         { _id: from },
         { $set: { updatedAt: new Date(), ...(name ? { name } : {}) }, $setOnInsert: { _id: from } },
         { upsert: true }
       );
+      logEvent('whatsapp', 'group_captured', `Grup tersimpan: ${name || '(tanpa nama)'} [${from}]`);
     } catch (err) {
-      // Jangan sampai gagal simpan grup mengganggu alur pesan lain.
       logEvent('whatsapp', 'group_upsert', 'Gagal simpan grup: ' + err.message, 'warn');
     }
-  });
+  };
+
+  client.on('message_create', handleMessage);
+  client.on('message', handleMessage);
 
   setClient(client);
 
