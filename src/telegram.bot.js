@@ -3,6 +3,7 @@ import { processMessageWithAI } from './ai.service.js';
 import { addCalendarEvent } from './google.service.js';
 import { getGlobalNews } from './news.service.js';
 import { getRecentHistory, saveMessage } from './conversation.service.js';
+import { getProfile, ensureProfile, setNickname, addNote } from './user.service.js';
 
 export function initTelegramBot() {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -17,25 +18,34 @@ export function initTelegramBot() {
   console.log('[TelegramBot] Polling started successfully.');
 
   bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
+    const chatId = msg.chat.id;   // ke mana balasan dikirim
+    const userId = msg.from.id;   // SIAPA yang bicara - identitas unik per orang,
+                                   // dipakai untuk profil & riwayat supaya tidak
+                                   // bercampur antar pengguna (mis. kalau dipakai di grup).
     const text = msg.text;
     const username = msg.from.username || msg.from.first_name || 'User';
 
     if (!text) return;
 
+    await ensureProfile(userId, msg.from.username || null);
+
     if (text.startsWith('/start')) {
-      bot.sendMessage(chatId, `Halo ${username}! Saya Hermes, AI assistant Anda. Ada yang bisa saya bantu?`);
+      const profile = await getProfile(userId);
+      const greetName = profile.nickname || username;
+      bot.sendMessage(chatId, `Halo ${greetName}! Saya Hermes, AI assistant Anda. Ada yang bisa saya bantu?`);
       return;
     }
 
     try {
       bot.sendChatAction(chatId, 'typing');
 
-      // 0. Ambil riwayat percakapan supaya AI tidak "amnesia" tiap pesan
-      const history = await getRecentHistory(chatId);
+      // 0. Ambil profil permanen (nickname dll) + riwayat percakapan - keduanya
+      // dikunci per userId, jadi tiap orang punya "otak" sendiri-sendiri.
+      const profile = await getProfile(userId);
+      const history = await getRecentHistory(userId);
 
       // 1. Dapatkan Tool Call JSON dari AI
-      const toolCall = await processMessageWithAI(text, history);
+      const toolCall = await processMessageWithAI(text, history, profile);
       let finalResponse = toolCall.message;
 
       // 2. Eksekusi Tool (Aksi)
@@ -58,8 +68,16 @@ export function initTelegramBot() {
       bot.sendMessage(chatId, finalResponse, { parse_mode: 'Markdown' });
 
       // 4. Simpan giliran percakapan ini supaya jadi konteks pesan berikutnya
-      await saveMessage(chatId, 'user', text);
-      await saveMessage(chatId, 'assistant', finalResponse);
+      await saveMessage(userId, 'user', text);
+      await saveMessage(userId, 'assistant', finalResponse);
+
+      // 5. Kalau AI mendeteksi fakta permanen baru (mis. nama panggilan), simpan ke profil
+      if (toolCall.profileUpdate?.nickname) {
+        await setNickname(userId, toolCall.profileUpdate.nickname);
+      }
+      if (toolCall.profileUpdate?.note) {
+        await addNote(userId, toolCall.profileUpdate.note);
+      }
 
     } catch (error) {
       console.error('[TelegramBot Error]', error.message);

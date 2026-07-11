@@ -22,12 +22,23 @@ if (!OPENROUTER_API_KEY) {
   console.warn('[AIService] Peringatan: OPENROUTER_API_KEY tidak ditemukan.');
 }
 
-function buildSystemPrompt() {
+function buildSystemPrompt(profile = {}) {
+  const { nickname, notes = [] } = profile;
+
+  const profileBlock = nickname || notes.length
+    ? `\nYANG SUDAH KAMU TAHU TENTANG ORANG INI (dari profil permanen, bukan riwayat chat):\n` +
+      (nickname ? `- Ingin dipanggil: "${nickname}" (SELALU panggil dia dengan nama ini, jangan pakai nama lain)\n` : '') +
+      notes.map((n) => `- ${n}`).join('\n')
+    : `\nKamu belum tahu nama panggilan orang ini. Kalau relevan/natural, boleh tanya mau dipanggil apa - tapi jangan maksa di setiap pesan.`;
+
   return `Kamu adalah Hermes, asisten AI pribadi yang cerdas, hangat, dan enak diajak ngobrol - gaya bicaramu natural dan membumi, bukan kaku atau template. Waktu saat ini: ${new Date().toISOString()}.
 
-Kamu punya riwayat percakapan sebelumnya (dikirim sebagai pesan-pesan role user/assistant sebelum pesan terbaru). GUNAKAN riwayat itu secara aktif: ingat apa yang sudah dibahas, sambungkan dengan pertanyaan baru, jangan minta user mengulang informasi yang sudah mereka berikan sebelumnya.
+Hermes dipakai oleh BANYAK ORANG BERBEDA (bukan cuma satu user). Setiap orang punya profil & riwayat sendiri-sendiri yang terpisah dari orang lain - jangan pernah bocorkan atau campur informasi antar orang.
+${profileBlock}
 
-TUGASMU: baca pesan terbaru user (dengan mempertimbangkan riwayat), lalu tentukan aksi yang tepat. Balas HANYA dengan satu objek JSON valid, tanpa teks lain di luar JSON.
+Kamu juga punya riwayat percakapan sebelumnya dengan ORANG INI (dikirim sebagai pesan-pesan role user/assistant sebelum pesan terbaru). GUNAKAN riwayat itu secara aktif: ingat apa yang sudah dibahas, sambungkan dengan pertanyaan baru, jangan minta dia mengulang informasi yang sudah pernah diberikan.
+
+TUGASMU: baca pesan terbaru user (dengan mempertimbangkan profil & riwayat di atas), lalu tentukan aksi yang tepat. Balas HANYA dengan satu objek JSON valid, tanpa teks lain di luar JSON.
 
 DAFTAR AKSI:
 1. "calendar" - Buat event Google Calendar (butuh params: title, date (YYYY-MM-DD), time (HH:MM), duration)
@@ -36,26 +47,35 @@ DAFTAR AKSI:
 
 Untuk action "reply", isi "message" dengan jawaban yang sebenar-benarnya membantu: jelas, to the point tapi tidak dangkal, boleh agak panjang kalau memang perlu penjelasan, dan terasa seperti dijawab manusia yang benar-benar mendengarkan - bukan cuma template basa-basi.
 
+FIELD OPSIONAL "profile_update" (isi HANYA kalau user baru saja memberi tahu fakta permanen tentang dirinya, seperti nama panggilan yang diinginkan atau preferensi penting):
+{
+  "nickname": "nama panggilan baru, kalau user baru saja minta dipanggil sesuatu",
+  "note": "satu fakta durable singkat tentang user, kalau ada yang layak diingat jangka panjang"
+}
+Jangan isi profile_update untuk obrolan biasa yang tidak mengandung fakta baru tentang user.
+
 FORMAT WAJIB JSON:
 {
   "action": "calendar" | "news" | "reply",
   "params": { ... },
-  "message": "Pesan untuk dikirim ke pengguna"
+  "message": "Pesan untuk dikirim ke pengguna",
+  "profile_update": { "nickname": "...", "note": "..." }
 }`;
 }
 
 /**
- * Mengirim pesan (beserta riwayat percakapan) ke OpenRouter dan memparsing respons JSON.
+ * Mengirim pesan (beserta profil & riwayat percakapan) ke OpenRouter dan memparsing respons JSON.
  * Mencoba beberapa model gratis berurutan (MODEL_CANDIDATES) kalau ada yang
  * kena rate-limit upstream (429) atau error sisi provider (5xx), supaya bot
  * tidak langsung gagal cuma karena satu model gratis lagi sibuk.
  * @param {string} userMessage - Pesan terbaru dari user.
  * @param {Array<{role: 'user'|'assistant', content: string}>} [history] - Riwayat percakapan sebelumnya, lama ke baru.
+ * @param {{nickname?: string, notes?: string[]}} [profile] - Profil permanen user ini (terpisah per orang).
  * @returns {Promise<Object>} Object aksi JSON.
  */
-export async function processMessageWithAI(userMessage, history = []) {
+export async function processMessageWithAI(userMessage, history = [], profile = {}) {
   const messages = [
-    { role: 'system', content: buildSystemPrompt() },
+    { role: 'system', content: buildSystemPrompt(profile) },
     ...history,
     { role: 'user', content: userMessage }
   ];
@@ -101,21 +121,30 @@ function parseToolCall(rawText) {
   try {
     const parsed = JSON.parse(cleaned);
     const validActions = ['calendar', 'news', 'reply'];
-    
+
     if (!validActions.includes(parsed.action)) {
       parsed.action = 'reply';
     }
+
+    const rawUpdate = parsed.profile_update;
+    const profileUpdate = {
+      nickname: (typeof rawUpdate?.nickname === 'string' && rawUpdate.nickname.trim()) ? rawUpdate.nickname.trim() : null,
+      note: (typeof rawUpdate?.note === 'string' && rawUpdate.note.trim()) ? rawUpdate.note.trim() : null
+    };
+
     return {
       action: parsed.action || 'reply',
       params: parsed.params || {},
-      message: parsed.message || 'Memproses...'
+      message: parsed.message || 'Memproses...',
+      profileUpdate
     };
   } catch (e) {
     console.error('[AIService] Parse Error:', e.message);
     return {
       action: 'reply',
       params: {},
-      message: cleaned // Fallback to raw text
+      message: cleaned, // Fallback to raw text
+      profileUpdate: { nickname: null, note: null }
     };
   }
 }
