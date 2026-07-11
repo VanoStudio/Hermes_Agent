@@ -102,10 +102,18 @@ export async function initWhatsAppBot() {
     // tepat setelah reconnect). Ambil kapan saja lewat endpoint GET /groups.
   });
 
-  // Listener kecil untuk mengetahui ID saat diinvite ke grup baru
-  client.on('message', async msg => {
-    if (msg.body === '!groupinfo' && msg.author) {
-      msg.reply(`ID Grup ini: ${msg.from}`);
+  // Jalur PALING andal untuk dapat ID grup, bahkan saat browser lagi berat:
+  // ketik "!groupinfo" di grup target, bot balas ID-nya. Pakai 'message_create'
+  // (bukan cuma 'message') supaya pesan yang KITA kirim sendiri dari HP juga
+  // ketangkap - jadi tidak perlu minta orang lain yang mengetik.
+  client.on('message_create', async msg => {
+    if (msg.body === '!groupinfo' && msg.from.endsWith('@g.us')) {
+      try {
+        await msg.reply(`ID Grup ini: ${msg.from}`);
+        logEvent('whatsapp', 'groupinfo', `Group ID diminta: ${msg.from}`);
+      } catch (err) {
+        logEvent('whatsapp', 'groupinfo', 'Gagal balas !groupinfo: ' + err.message, 'warn');
+      }
     }
   });
 

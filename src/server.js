@@ -60,23 +60,29 @@ export function startServer() {
     }
 
     try {
-      // Sengaja TIDAK pakai client.getChats() - fungsi itu memanggil
-      // groupMetadata.update() (request jaringan live ke server WhatsApp)
-      // untuk SETIAP grup, jadi bisa memakan waktu menit-an dan gampang
-      // timeout di CPU terbatas seperti Railway. Di sini kita cuma butuh
-      // nama + ID, jadi baca langsung dari Store yang sudah ada di memori
-      // tanpa memicu request tambahan apa pun - hasilnya instan.
+      // Sengaja TIDAK pakai client.getChats() maupun mengakses chat.groupMetadata.
+      // chat.groupMetadata adalah LAZY GETTER - begitu diakses, WhatsApp Web
+      // memicu request metadata live ke server untuk tiap grup, itulah yang bikin
+      // timeout di CPU terbatas Railway. Untuk sekadar nama + ID, kita cukup cek
+      // ID-nya (grup = server 'g.us') tanpa menyentuh metadata sama sekali -> instan.
       const groups = await Promise.race([
         client.pupPage.evaluate(() => {
           const chats = window.require('WAWebCollections').Chat.getModelsArray();
-          return chats
-            .filter((chat) => !!chat.groupMetadata)
-            .map((chat) => ({
-              name: chat.name || chat.formattedTitle || chat.id.user,
-              id: chat.id._serialized
-            }));
+          const out = [];
+          for (const c of chats) {
+            try {
+              const id = c.id;
+              const isGroup =
+                (typeof id?.isGroup === 'function' ? id.isGroup() : id?.server === 'g.us');
+              if (!isGroup) continue;
+              let name = '';
+              try { name = c.formattedTitle || c.name || ''; } catch (e) { /* getter error, abaikan */ }
+              out.push({ name: name || id.user || id._serialized, id: id._serialized });
+            } catch (e) { /* lewati chat bermasalah */ }
+          }
+          return out;
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout 15 detik saat membaca Store WhatsApp Web')), 15000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout saat membaca Store WhatsApp Web')), 30000))
       ]);
 
       res.json({ count: groups.length, groups });
