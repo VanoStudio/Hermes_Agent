@@ -26,9 +26,18 @@ export async function initWhatsAppBot() {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--no-first-run',
-      '--no-zygote'
+      '--no-zygote',
       // NOTE: '--single-process' sengaja dihapus - flag ini sering menyebabkan
       // Chromium crash di container Railway sebelum event 'qr' sempat muncul.
+      // Flag di bawah ini mematikan fitur Chromium yang tidak dipakai bot,
+      // supaya jejak memorinya lebih kecil di container Railway.
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--disable-translate',
+      '--mute-audio',
+      '--no-default-browser-check'
     ]
   };
 
@@ -41,7 +50,14 @@ export async function initWhatsAppBot() {
   const client = new Client({
     authStrategy: new RemoteAuth({
       store: store,
-      backupSyncIntervalMs: 300000 // Sinkronisasi setiap 5 menit
+      backupSyncIntervalMs: 300000, // Sinkronisasi setiap 5 menit
+      // KRUSIAL: wwebjs-mongo (MongoStore.save) membaca file zip session
+      // dari path relatif ke process.cwd() ("RemoteAuth.zip"), sedangkan
+      // whatsapp-web.js (RemoteAuth) menulisnya ke `${dataPath}/RemoteAuth.zip`.
+      // Kalau dataPath dibiarkan default ('./.wwebjs_auth/'), kedua path itu
+      // tidak pernah cocok -> ENOENT saat backup pertama -> proses crash.
+      // Set dataPath ke root project supaya keduanya menunjuk file yang sama.
+      dataPath: '.'
     }),
     puppeteer: puppeteerConfig
   });
@@ -49,8 +65,11 @@ export async function initWhatsAppBot() {
   client.on('qr', (qr) => {
     setQr(qr);
     logEvent('whatsapp', 'qr', 'QR code baru digenerate. Buka endpoint /qr di URL Railway untuk scan.');
-    // Fallback ASCII di console, berguna saat development lokal.
-    qrcode.generate(qr, { small: true });
+    // ASCII QR di console cuma berguna untuk dev lokal - di production (Railway)
+    // karakter blok Unicode-nya sering rusak di log viewer, jadi dimatikan.
+    if (process.env.NODE_ENV !== 'production') {
+      qrcode.generate(qr, { small: true });
+    }
   });
 
   client.on('authenticated', () => {

@@ -52,4 +52,11 @@ process.on('unhandledRejection', (reason) => {
   console.error('[Unhandled Rejection]', reason);
 });
 
+// Menangkap exception tak tertangani dari dependency pihak ketiga (mis. stream
+// error internal whatsapp-web.js/wwebjs-mongo) supaya proses tidak langsung mati
+// dan memicu restart-loop Chromium yang menghabiskan memori container.
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]', err);
+});
+
 bootstrap();
