@@ -11,6 +11,7 @@ export async function getProfile(userId) {
   const doc = await UserProfile.findById(String(userId));
   return {
     nickname: doc?.nickname || null,
+    assistantName: doc?.assistantName || null,
     notes: doc?.notes || []
   };
 }
@@ -34,6 +35,18 @@ export async function setNickname(userId, nickname) {
   await UserProfile.updateOne(
     { _id: String(userId) },
     { $set: { nickname: nickname.trim().slice(0, 50), updatedAt: new Date() } },
+    { upsert: true }
+  );
+}
+
+/**
+ * Simpan/ubah nama panggilan AI ini KHUSUS untuk user tersebut (tidak
+ * mempengaruhi user lain sama sekali - tiap orang bisa kasih nama beda).
+ */
+export async function setAssistantName(userId, name) {
+  await UserProfile.updateOne(
+    { _id: String(userId) },
+    { $set: { assistantName: name.trim().slice(0, 50), updatedAt: new Date() } },
     { upsert: true }
   );
 }

@@ -1,6 +1,55 @@
 import Parser from 'rss-parser';
+import axios from 'axios';
+import { JSDOM } from 'jsdom';
+import { Readability } from '@mozilla/readability';
 
 const parser = new Parser();
+
+// Batas panjang teks artikel yang diikutkan ke AI - cukup untuk ringkasan
+// 2-3 paragraf yang akurat, tapi tidak membengkakkan prompt tanpa perlu.
+const MAX_ARTICLE_CHARS = 4000;
+const ARTICLE_FETCH_TIMEOUT_MS = 8000;
+
+/**
+ * Ambil isi teks penuh sebuah artikel berita (bukan cuma cuplikan RSS),
+ * pakai Readability (mesin yang sama dengan Firefox Reader View) supaya
+ * bekerja generik di berbagai situs berita tanpa scraping khusus per situs.
+ * Gagal dengan aman (return null) kalau situs sumber memblokir/timeout -
+ * pemanggil harus fallback ke cuplikan RSS biasa.
+ * @param {string} url
+ * @returns {Promise<string|null>}
+ */
+export async function fetchArticleFullText(url) {
+  try {
+    const res = await axios.get(url, {
+      timeout: ARTICLE_FETCH_TIMEOUT_MS,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    const dom = new JSDOM(res.data, { url });
+    const article = new Readability(dom.window.document).parse();
+    const text = article?.textContent?.trim();
+    if (!text) return null;
+    return text.slice(0, MAX_ARTICLE_CHARS);
+  } catch (error) {
+    console.warn(`[NewsService] Gagal ambil isi artikel penuh (${url}):`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Lengkapi daftar berita dengan isi artikel penuh (best-effort, paralel).
+ * Item yang gagal diambil tetap dipertahankan, cuma pakai description (RSS
+ * snippet) sebagai fallback isinya - supaya satu sumber lambat/bermasalah
+ * tidak menggagalkan seluruh daftar.
+ * @param {Array<{title: string, description: string, url: string}>} newsList
+ */
+export async function attachFullText(newsList) {
+  const results = await Promise.allSettled(newsList.map((n) => fetchArticleFullText(n.url)));
+  return newsList.map((n, i) => ({
+    ...n,
+    fullText: (results[i].status === 'fulfilled' && results[i].value) || n.description
+  }));
+}
 
 /**
  * Mengambil berita global dari RSS BBC World News

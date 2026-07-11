@@ -7,7 +7,8 @@ import mongoose from 'mongoose';
 const userSchema = new mongoose.Schema({
   _id: { type: String },              // Telegram user id (string)
   telegramUsername: { type: String, default: null },
-  nickname: { type: String, default: null },
+  nickname: { type: String, default: null },       // nama panggilan UNTUK user ini
+  assistantName: { type: String, default: null },  // nama AI ini KHUSUS untuk user tsb
   notes: { type: [String], default: [] }, // fakta durable lain, mis. preferensi
   updatedAt: { type: Date, default: Date.now }
 });

@@ -2,12 +2,14 @@ import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from '@whis
 import pino from 'pino';
 import mongoose from 'mongoose';
 import cron from 'node-cron';
-import { getAINews } from './news.service.js';
+import { getAINews, attachFullText } from './news.service.js';
+import { summarizeNewsArticles } from './ai.service.js';
 import { setQr, setStatus } from './qr.state.js';
 import { logEvent } from './logger.service.js';
 import { setClient } from './wa.state.js';
 import { Group } from './group.model.js';
 import { useMongoAuthState } from './wa.mongo.auth.js';
+import { chunkText } from './message.util.js';
 
 // Logger senyap untuk Baileys - hemat memori & tidak membanjiri log Railway.
 const logger = pino({ level: 'silent' });
@@ -143,8 +145,11 @@ export async function refreshGroups(sock) {
   return entries.length;
 }
 
+const WA_DAILY_NEWS_COUNT = 3;
+
 /**
- * CronJob broadcast berita AI harian ke WA_GROUP_ID (jam 08:00 WIB).
+ * CronJob broadcast berita teknologi & AI harian ke WA_GROUP_ID (08:00 WIB),
+ * ringkasan 2-3 paragraf per berita berdasarkan isi artikel penuh.
  * @param {import('@whiskeysockets/baileys').WASocket} sock
  */
 function scheduleDailyBroadcast(sock) {
@@ -156,16 +161,21 @@ function scheduleDailyBroadcast(sock) {
 
   console.log(`[WhatsAppBot] Cron Broadcast aktif untuk grup: ${WA_GROUP_ID} (08:00 WIB)`);
   cron.schedule('0 8 * * *', async () => {
-    console.log('[WhatsAppBot] Cron: fetch berita AI untuk broadcast...');
+    console.log('[WhatsAppBot] Cron: menyiapkan ringkasan berita AI/teknologi...');
     try {
-      const newsList = await getAINews(2);
-      let newsMsg =
-        newsList.length > 0
-          ? newsList.map((n, i) => `*${i + 1}. ${n.title}*\n_${n.description}_\n🔗 ${n.url}`).join('\n\n')
-          : '⚠️ Tidak ada berita AI terbaru hari ini.';
+      const newsList = await getAINews(WA_DAILY_NEWS_COUNT);
+      let body;
+      if (newsList.length === 0) {
+        body = '⚠️ Tidak ada berita AI/teknologi terbaru hari ini.';
+      } else {
+        const enriched = await attachFullText(newsList);
+        body = await summarizeNewsArticles(enriched);
+      }
 
-      const greeting = `🤖 *Automated Hermes Broadcast*\nSelamat Pagi! Berikut ringkasan AI hari ini:\n\n`;
-      await sock.sendMessage(WA_GROUP_ID, { text: greeting + newsMsg });
+      const greeting = `🤖 *Hermes Daily Tech & AI Briefing*\nSelamat Pagi! Berikut ${newsList.length} berita teknologi & AI hari ini:\n\n`;
+      for (const chunk of chunkText(greeting + body, 4000)) {
+        await sock.sendMessage(WA_GROUP_ID, { text: chunk });
+      }
       logEvent('whatsapp', 'broadcast', 'Broadcast harian terkirim.');
     } catch (error) {
       logEvent('whatsapp', 'broadcast', 'Broadcast gagal: ' + error.message, 'error');

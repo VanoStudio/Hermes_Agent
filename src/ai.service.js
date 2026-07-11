@@ -22,70 +22,25 @@ if (!OPENROUTER_API_KEY) {
   console.warn('[AIService] Peringatan: OPENROUTER_API_KEY tidak ditemukan.');
 }
 
-function buildSystemPrompt(profile = {}) {
-  const { nickname, notes = [] } = profile;
-
-  const profileBlock = nickname || notes.length
-    ? `\nYANG SUDAH KAMU TAHU TENTANG ORANG INI (dari profil permanen, bukan riwayat chat):\n` +
-      (nickname ? `- Ingin dipanggil: "${nickname}" (SELALU panggil dia dengan nama ini, jangan pakai nama lain)\n` : '') +
-      notes.map((n) => `- ${n}`).join('\n')
-    : `\nKamu belum tahu nama panggilan orang ini. Kalau relevan/natural, boleh tanya mau dipanggil apa - tapi jangan maksa di setiap pesan.`;
-
-  return `Kamu adalah Hermes, asisten AI pribadi yang cerdas, hangat, dan enak diajak ngobrol - gaya bicaramu natural dan membumi, bukan kaku atau template. Waktu saat ini: ${new Date().toISOString()}.
-
-Hermes dipakai oleh BANYAK ORANG BERBEDA (bukan cuma satu user). Setiap orang punya profil & riwayat sendiri-sendiri yang terpisah dari orang lain - jangan pernah bocorkan atau campur informasi antar orang.
-${profileBlock}
-
-Kamu juga punya riwayat percakapan sebelumnya dengan ORANG INI (dikirim sebagai pesan-pesan role user/assistant sebelum pesan terbaru). GUNAKAN riwayat itu secara aktif: ingat apa yang sudah dibahas, sambungkan dengan pertanyaan baru, jangan minta dia mengulang informasi yang sudah pernah diberikan.
-
-TUGASMU: baca pesan terbaru user (dengan mempertimbangkan profil & riwayat di atas), lalu tentukan aksi yang tepat. Balas HANYA dengan satu objek JSON valid, tanpa teks lain di luar JSON.
-
-DAFTAR AKSI:
-1. "calendar" - Buat event Google Calendar (butuh params: title, date (YYYY-MM-DD), time (HH:MM), duration)
-2. "news" - Cari berita (butuh params: query)
-3. "reply" - Percakapan biasa / pertanyaan apa pun yang tidak butuh aksi khusus (params kosong {})
-
-Untuk action "reply", isi "message" dengan jawaban yang sebenar-benarnya membantu: jelas, to the point tapi tidak dangkal, boleh agak panjang kalau memang perlu penjelasan, dan terasa seperti dijawab manusia yang benar-benar mendengarkan - bukan cuma template basa-basi.
-
-FIELD OPSIONAL "profile_update" (isi HANYA kalau user baru saja memberi tahu fakta permanen tentang dirinya, seperti nama panggilan yang diinginkan atau preferensi penting):
-{
-  "nickname": "nama panggilan baru, kalau user baru saja minta dipanggil sesuatu",
-  "note": "satu fakta durable singkat tentang user, kalau ada yang layak diingat jangka panjang"
-}
-Jangan isi profile_update untuk obrolan biasa yang tidak mengandung fakta baru tentang user.
-
-FORMAT WAJIB JSON:
-{
-  "action": "calendar" | "news" | "reply",
-  "params": { ... },
-  "message": "Pesan untuk dikirim ke pengguna",
-  "profile_update": { "nickname": "...", "note": "..." }
-}`;
-}
-
 /**
- * Mengirim pesan (beserta profil & riwayat percakapan) ke OpenRouter dan memparsing respons JSON.
- * Mencoba beberapa model gratis berurutan (MODEL_CANDIDATES) kalau ada yang
- * kena rate-limit upstream (429) atau error sisi provider (5xx), supaya bot
- * tidak langsung gagal cuma karena satu model gratis lagi sibuk.
- * @param {string} userMessage - Pesan terbaru dari user.
- * @param {Array<{role: 'user'|'assistant', content: string}>} [history] - Riwayat percakapan sebelumnya, lama ke baru.
- * @param {{nickname?: string, notes?: string[]}} [profile] - Profil permanen user ini (terpisah per orang).
- * @returns {Promise<Object>} Object aksi JSON.
+ * Panggil OpenRouter, coba beberapa model berurutan (MODEL_CANDIDATES) kalau
+ * ada yang kena rate-limit upstream (429) atau error sisi provider (5xx),
+ * supaya satu model gratis lagi sibuk tidak langsung menggagalkan permintaan.
+ * @param {Array<{role: string, content: string}>} messages
+ * @param {{jsonMode?: boolean}} [opts]
+ * @returns {Promise<string>} Raw text dari respons AI.
  */
-export async function processMessageWithAI(userMessage, history = [], profile = {}) {
-  const messages = [
-    { role: 'system', content: buildSystemPrompt(profile) },
-    ...history,
-    { role: 'user', content: userMessage }
-  ];
-
+async function callOpenRouterWithFallback(messages, { jsonMode = true } = {}) {
   let lastError;
   for (const model of MODEL_CANDIDATES) {
     try {
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
-        { model, messages, response_format: { type: 'json_object' } },
+        {
+          model,
+          messages,
+          ...(jsonMode ? { response_format: { type: 'json_object' } } : {})
+        },
         {
           headers: {
             'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
@@ -95,9 +50,7 @@ export async function processMessageWithAI(userMessage, history = [], profile = 
           }
         }
       );
-
-      const rawText = response.data.choices[0].message.content;
-      return parseToolCall(rawText);
+      return response.data.choices[0].message.content;
     } catch (error) {
       lastError = error;
       const status = error.response?.status;
@@ -106,8 +59,93 @@ export async function processMessageWithAI(userMessage, history = [], profile = 
       if (!retryable) break; // error bukan soal ketersediaan model (mis. API key salah) -> jangan coba model lain
     }
   }
-
   throw new Error('Gagal menghubungi otak AI (semua model OpenRouter gagal): ' + (lastError?.message || 'unknown'));
+}
+
+function buildSystemPrompt(profile = {}) {
+  const { nickname, notes = [], assistantName } = profile;
+  const myName = assistantName || 'Hermes';
+
+  const profileBlock = nickname || notes.length
+    ? `\nYANG SUDAH KAMU TAHU TENTANG ORANG INI (dari profil permanen, bukan riwayat chat):\n` +
+      (nickname ? `- Ingin dipanggil: "${nickname}" (SELALU panggil DIA dengan nama ini, jangan pakai nama lain)\n` : '') +
+      notes.map((n) => `- ${n}`).join('\n')
+    : `\nKamu belum tahu nama panggilan orang ini. Kalau relevan/natural, boleh tanya mau dipanggil apa - tapi jangan maksa di setiap pesan.`;
+
+  return `Kamu adalah asisten AI pribadi. Untuk orang yang sedang mengobrol denganmu SEKARANG, namamu adalah "${myName}" - begitulah dia memanggilmu dan begitulah kamu memperkenalkan dirimu ke dia. Gaya bicaramu cerdas, hangat, dan enak diajak ngobrol - natural dan membumi, bukan kaku atau template. Waktu saat ini: ${new Date().toISOString()}.
+
+Kamu dipakai oleh BANYAK ORANG BERBEDA (bukan cuma satu user). Setiap orang punya profil & riwayat sendiri-sendiri yang terpisah dari orang lain - jangan pernah bocorkan atau campur informasi antar orang. Nama panggilanmu ("${myName}") juga BISA BEDA untuk tiap orang - orang lain mungkin memanggilmu dengan nama lain, itu normal.
+${profileBlock}
+
+Kamu juga punya riwayat percakapan sebelumnya dengan ORANG INI (dikirim sebagai pesan-pesan role user/assistant sebelum pesan terbaru). GUNAKAN riwayat itu secara aktif: ingat apa yang sudah dibahas, sambungkan dengan pertanyaan baru, jangan minta dia mengulang informasi yang sudah pernah diberikan.
+
+TUGASMU: baca pesan terbaru user (dengan mempertimbangkan profil & riwayat di atas), lalu tentukan aksi yang tepat. Balas HANYA dengan satu objek JSON valid, tanpa teks lain di luar JSON.
+
+DAFTAR AKSI:
+1. "calendar" - Buat event Google Calendar (butuh params: title, date (YYYY-MM-DD), time (HH:MM), duration)
+2. "news" - Cari/tampilkan berita (butuh params: query)
+3. "reply" - Percakapan biasa / pertanyaan apa pun yang tidak butuh aksi khusus (params kosong {})
+
+Untuk action "reply", isi "message" dengan jawaban yang sebenar-benarnya membantu: jelas, to the point tapi tidak dangkal, boleh agak panjang kalau memang perlu penjelasan, dan terasa seperti dijawab manusia yang benar-benar mendengarkan - bukan cuma template basa-basi.
+
+FIELD OPSIONAL "profile_update" - isi HANYA kalau relevan, dan PERHATIKAN BAIK-BAIK BEDANYA:
+- "nickname": diisi kalau USER minta DIRINYA SENDIRI dipanggil dengan nama tertentu (mis. "panggil aku Eyinaa"). Ini nama UNTUK USER.
+- "assistant_name": diisi HANYA kalau USER secara eksplisit memberi/mengganti NAMAMU (mis. "aku mau manggil kamu Jarwis", "nama kamu sekarang Nova aja"). Ini nama untuk KAMU (si AI), dan HANYA berlaku untuk user yang memintanya - jangan pernah anggap ini berubah untuk user lain.
+- "note": satu fakta durable singkat tentang user, kalau ada yang layak diingat jangka panjang.
+JANGAN TERTUKAR antara nickname (nama untuk user) dan assistant_name (nama untukmu). Jangan isi field yang tidak relevan dengan pesan terbaru.
+
+FORMAT WAJIB JSON:
+{
+  "action": "calendar" | "news" | "reply",
+  "params": { ... },
+  "message": "Pesan untuk dikirim ke pengguna",
+  "profile_update": { "nickname": "...", "assistant_name": "...", "note": "..." }
+}`;
+}
+
+/**
+ * Mengirim pesan (beserta profil & riwayat percakapan) ke OpenRouter dan memparsing respons JSON.
+ * @param {string} userMessage - Pesan terbaru dari user.
+ * @param {Array<{role: 'user'|'assistant', content: string}>} [history] - Riwayat percakapan sebelumnya, lama ke baru.
+ * @param {{nickname?: string, notes?: string[], assistantName?: string}} [profile] - Profil permanen user ini (terpisah per orang).
+ * @returns {Promise<Object>} Object aksi JSON.
+ */
+export async function processMessageWithAI(userMessage, history = [], profile = {}) {
+  const messages = [
+    { role: 'system', content: buildSystemPrompt(profile) },
+    ...history,
+    { role: 'user', content: userMessage }
+  ];
+  const rawText = await callOpenRouterWithFallback(messages, { jsonMode: true });
+  return parseToolCall(rawText);
+}
+
+const NEWS_SUMMARY_SYSTEM_PROMPT = `Kamu adalah asisten peringkas berita. Untuk SETIAP artikel yang diberikan, tulis ringkasan 2-3 paragraf yang mendalam dan mengalir enak dibaca, HANYA berdasarkan isi artikel yang diberikan - jangan mengarang atau menambah fakta yang tidak ada di teks sumber. Tulis dalam Bahasa Indonesia.
+
+Format tiap item (pakai Markdown gaya Telegram):
+*<nomor>. <judul berita>*
+<2-3 paragraf ringkasan>
+🔗 <url sumber>
+
+Pisahkan tiap item dengan baris kosong. Jangan tambahkan pembuka/penutup di luar daftar item, langsung mulai dari item nomor 1.`;
+
+/**
+ * Buat ringkasan mendalam (2-3 paragraf) untuk tiap artikel berita, berbasis
+ * isi artikel penuh (bukan cuplikan RSS) - dipakai untuk broadcast harian
+ * maupun permintaan berita on-demand supaya hasilnya selalu substantif.
+ * @param {Array<{title: string, url: string, fullText: string}>} articles
+ * @returns {Promise<string>} Teks markdown siap kirim.
+ */
+export async function summarizeNewsArticles(articles) {
+  const userContent = articles
+    .map((a, i) => `### Artikel ${i + 1}\nJudul: ${a.title}\nURL: ${a.url}\nIsi:\n${a.fullText}`)
+    .join('\n\n---\n\n');
+
+  const messages = [
+    { role: 'system', content: NEWS_SUMMARY_SYSTEM_PROMPT },
+    { role: 'user', content: userContent }
+  ];
+  return (await callOpenRouterWithFallback(messages, { jsonMode: false })).trim();
 }
 
 /**
@@ -129,6 +167,7 @@ function parseToolCall(rawText) {
     const rawUpdate = parsed.profile_update;
     const profileUpdate = {
       nickname: (typeof rawUpdate?.nickname === 'string' && rawUpdate.nickname.trim()) ? rawUpdate.nickname.trim() : null,
+      assistantName: (typeof rawUpdate?.assistant_name === 'string' && rawUpdate.assistant_name.trim()) ? rawUpdate.assistant_name.trim() : null,
       note: (typeof rawUpdate?.note === 'string' && rawUpdate.note.trim()) ? rawUpdate.note.trim() : null
     };
 
@@ -144,7 +183,7 @@ function parseToolCall(rawText) {
       action: 'reply',
       params: {},
       message: cleaned, // Fallback to raw text
-      profileUpdate: { nickname: null, note: null }
+      profileUpdate: { nickname: null, assistantName: null, note: null }
     };
   }
 }
