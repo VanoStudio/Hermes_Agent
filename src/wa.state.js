@@ -1,4 +1,4 @@
-// Menyimpan referensi Client whatsapp-web.js yang sedang aktif,
+// Menyimpan referensi socket Baileys yang sedang aktif,
 // dibaca oleh server.js untuk endpoint on-demand seperti /groups.
 
 let client = null;

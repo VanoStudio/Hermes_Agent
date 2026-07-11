@@ -1,14 +1,18 @@
-import pkg from 'whatsapp-web.js';
-const { Client, RemoteAuth } = pkg;
-import { MongoStore } from 'wwebjs-mongo';
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import pino from 'pino';
 import mongoose from 'mongoose';
-import qrcode from 'qrcode-terminal';
 import cron from 'node-cron';
 import { getAINews } from './news.service.js';
 import { setQr, setStatus } from './qr.state.js';
 import { logEvent } from './logger.service.js';
 import { setClient } from './wa.state.js';
 import { Group } from './group.model.js';
+import { useMongoAuthState } from './wa.mongo.auth.js';
+
+// Logger senyap untuk Baileys - hemat memori & tidak membanjiri log Railway.
+const logger = pino({ level: 'silent' });
+
+let broadcastScheduled = false;
 
 export async function initWhatsAppBot() {
   const MONGODB_URI = process.env.MONGODB_URI;
@@ -17,213 +21,154 @@ export async function initWhatsAppBot() {
     return null;
   }
 
-  // Wwebjs-mongo membutuhkan koneksi mongoose yang sudah terbuka
-  const store = new MongoStore({ mongoose: mongoose });
+  // Auth-state disimpan di MongoDB (koleksi wa_auth) supaya sesi awet lintas restart.
+  const authColl = mongoose.connection.db.collection('wa_auth');
+  const { state, saveCreds, clearState } = await useMongoAuthState(authColl);
+  const { version } = await fetchLatestBaileysVersion();
+  console.log(`[WhatsAppBot] Baileys pakai WA version ${version.join('.')}`);
 
-  const puppeteerConfig = {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      // NOTE: '--single-process' sengaja dihapus - flag ini sering menyebabkan
-      // Chromium crash di container Railway sebelum event 'qr' sempat muncul.
-      // Flag di bawah ini mematikan fitur Chromium yang tidak dipakai bot,
-      // supaya jejak memorinya lebih kecil di container Railway.
-      '--disable-extensions',
-      '--disable-background-networking',
-      '--disable-default-apps',
-      '--disable-sync',
-      '--disable-translate',
-      '--mute-audio',
-      '--no-default-browser-check'
-    ]
-  };
-
-  // Gunakan Chromium bawaan OS (diinstall via apt di Dockerfile)
-  // Fallback: cek ENV, lalu cek path default Debian
-  const chromiumPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
-  puppeteerConfig.executablePath = chromiumPath;
-  // Naikkan batas waktu protokol CDP (default Puppeteer bisa kepotong duluan
-  // di CPU Railway yang terbatas, terutama saat evaluate berat seperti getChats()).
-  puppeteerConfig.protocolTimeout = 180000; // 3 menit
-  console.log(`[WhatsAppBot] Menggunakan Chromium di: ${chromiumPath}`);
-
-  const client = new Client({
-    authStrategy: new RemoteAuth({
-      store: store,
-      backupSyncIntervalMs: 300000, // Sinkronisasi setiap 5 menit
-      // KRUSIAL: wwebjs-mongo (MongoStore.save) membaca file zip session
-      // dari path relatif ke process.cwd() ("RemoteAuth.zip"), sedangkan
-      // whatsapp-web.js (RemoteAuth) menulisnya ke `${dataPath}/RemoteAuth.zip`.
-      // Kalau dataPath dibiarkan default ('./.wwebjs_auth/'), kedua path itu
-      // tidak pernah cocok -> ENOENT saat backup pertama -> proses crash.
-      // Set dataPath ke root project supaya keduanya menunjuk file yang sama.
-      dataPath: '.'
-    }),
-    puppeteer: puppeteerConfig
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    printQRInTerminal: false, // QR ditampilkan lewat endpoint /qr sebagai gambar
+    syncFullHistory: false,   // tidak perlu sync seluruh riwayat -> jauh lebih ringan
+    markOnlineOnConnect: false,
+    browser: ['Hermes Agent', 'Chrome', '1.0.0']
   });
 
-  client.on('qr', (qr) => {
-    setQr(qr);
-    logEvent('whatsapp', 'qr', 'QR code baru digenerate. Buka endpoint /qr di URL Railway untuk scan.');
-    // ASCII QR di console cuma berguna untuk dev lokal - di production (Railway)
-    // karakter blok Unicode-nya sering rusak di log viewer, jadi dimatikan.
-    if (process.env.NODE_ENV !== 'production') {
-      qrcode.generate(qr, { small: true });
-    }
-  });
+  setClient(sock);
 
-  client.on('authenticated', () => {
-    setStatus('authenticated');
-    logEvent('whatsapp', 'authenticated', 'Autentikasi berhasil, menunggu client siap.');
-  });
+  sock.ev.on('creds.update', saveCreds);
 
-  client.on('auth_failure', (msg) => {
-    setStatus('auth_failure');
-    logEvent('whatsapp', 'auth_failure', msg, 'error');
-  });
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-  client.on('disconnected', (reason) => {
-    setStatus('disconnected');
-    logEvent('whatsapp', 'disconnected', reason, 'warn');
-  });
-
-  client.on('remote_session_saved', () => {
-    logEvent('whatsapp', 'remote_session_saved', 'Sesi telah diamankan di MongoDB (RemoteAuth).');
-  });
-
-  client.on('ready', async () => {
-    setStatus('ready');
-    logEvent('whatsapp', 'ready', 'Bot WhatsApp berhasil terhubung!');
-    // Daftar grup tidak lagi di-fetch otomatis di sini (berat & rawan timeout
-    // tepat setelah reconnect). Ambil kapan saja lewat endpoint GET /groups.
-  });
-
-  // Handler pesan: pakai untuk (1) diagnostik pipeline event, (2) balas
-  // !groupinfo, (3) tangkap grup pasif ke Mongo. Dipasang ke DUA event:
-  // 'message_create' (termasuk pesan kita sendiri) dan 'message' (dari orang
-  // lain) supaya penangkapan grup tetap jalan dari sisi mana pun.
-  let msgPipelineLogged = false;
-  const handleMessage = async (msg) => {
-    // DIAGNOSTIK: catat sekali saja saat event pesan PERTAMA tiba. Kalau entri
-    // ini tidak pernah muncul di /logs, berarti halaman WA Web tidak mengirim
-    // event pesan sama sekali (bot tidak benar-benar menerima pesan).
-    if (!msgPipelineLogged) {
-      msgPipelineLogged = true;
-      logEvent('whatsapp', 'msg_pipeline', `Event pesan pertama diterima (from=${msg.from}, fromMe=${msg.fromMe})`);
+    if (qr) {
+      setQr(qr);
+      logEvent('whatsapp', 'qr', 'QR baru digenerate. Buka /qr di URL Railway untuk scan.');
     }
 
-    const from = msg.from;
-    if (!from || !from.endsWith('@g.us')) return;
-
-    // Balasan on-demand: ketik "!groupinfo" di grup target -> bot balas ID-nya.
-    if (msg.body === '!groupinfo') {
-      try {
-        await msg.reply(`ID Grup ini: ${from}`);
-        logEvent('whatsapp', 'groupinfo', `Balas !groupinfo untuk ${from}`);
-      } catch (err) {
-        logEvent('whatsapp', 'groupinfo', 'Gagal balas !groupinfo: ' + err.message, 'warn');
+    if (connection === 'open') {
+      setStatus('ready');
+      logEvent('whatsapp', 'ready', 'Bot WhatsApp (Baileys) berhasil terhubung!');
+      // Sekali terhubung, isi registry grup langsung (ringan, tanpa browser).
+      refreshGroups(sock).catch(() => {});
+      if (!broadcastScheduled) {
+        scheduleDailyBroadcast(sock);
+        broadcastScheduled = true;
       }
     }
 
-    try {
-      // Simpan ID dulu (dijamin ada). Nama diisi best-effort lewat pembacaan
-      // SATU chat saja (bukan scan semua) dan tanpa menyentuh groupMetadata.
-      const name = await getGroupNameLight(client, from);
-      await Group.updateOne(
-        { _id: from },
-        { $set: { updatedAt: new Date(), ...(name ? { name } : {}) }, $setOnInsert: { _id: from } },
-        { upsert: true }
-      );
-      logEvent('whatsapp', 'group_captured', `Grup tersimpan: ${name || '(tanpa nama)'} [${from}]`);
-    } catch (err) {
-      logEvent('whatsapp', 'group_upsert', 'Gagal simpan grup: ' + err.message, 'warn');
+    if (connection === 'connecting') {
+      setStatus('connecting');
     }
-  };
 
-  client.on('message_create', handleMessage);
-  client.on('message', handleMessage);
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      setStatus(loggedOut ? 'logged_out' : 'disconnected');
+      logEvent('whatsapp', 'disconnected', `Koneksi tertutup (code=${statusCode}, loggedOut=${loggedOut})`, 'warn');
 
-  setClient(client);
+      if (loggedOut) {
+        // Sesi tidak valid lagi -> bersihkan state supaya deploy berikutnya
+        // memunculkan QR baru untuk scan ulang.
+        await clearState().catch(() => {});
+        logEvent('whatsapp', 'logged_out', 'Sesi dihapus. Perlu scan QR ulang di /qr.', 'warn');
+      } else {
+        // Gangguan sementara -> reconnect.
+        logEvent('whatsapp', 'reconnect', 'Mencoba menyambung ulang...', 'info');
+        setTimeout(() => initWhatsAppBot().catch((e) => console.error('[WhatsAppBot] Reconnect gagal:', e.message)), 3000);
+      }
+    }
+  });
 
-  console.log('[WhatsAppBot] Memulai inisialisasi Client...');
-  await client.initialize();
-  return client;
-}
+  // Tangkap grup secara pasif + tangani perintah !groupinfo.
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      const from = msg.key?.remoteJid;
+      if (!from || !from.endsWith('@g.us')) continue;
 
-/**
- * Membaca nama SATU grup langsung dari Store WhatsApp Web (bukan scan semua chat),
- * tanpa menyentuh groupMetadata (yang lazy & memicu request jaringan berat).
- * Dibungkus race timeout pendek supaya kalau halaman lagi sibuk, kita tidak
- * menggantung - cukup kembalikan null dan pakai ID saja.
- * @param {import('whatsapp-web.js').Client} client
- * @param {string} groupId JID grup, contoh: xxxx@g.us
- * @returns {Promise<string|null>}
- */
-async function getGroupNameLight(client, groupId) {
-  if (!client.pupPage) return null;
-  try {
-    return await Promise.race([
-      client.pupPage.evaluate((gid) => {
+      const body =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        '';
+
+      if (body.trim() === '!groupinfo') {
         try {
-          const Store = window.require('WAWebCollections');
-          const wid = window.require('WAWebWidFactory').createWid(gid);
-          const chat = Store.Chat.get(wid);
-          if (!chat) return null;
-          return chat.formattedTitle || chat.name || null;
-        } catch (e) {
-          return null;
+          await sock.sendMessage(from, { text: `ID Grup ini: ${from}` });
+          logEvent('whatsapp', 'groupinfo', `Balas !groupinfo untuk ${from}`);
+        } catch (err) {
+          logEvent('whatsapp', 'groupinfo', 'Gagal balas !groupinfo: ' + err.message, 'warn');
         }
-      }, groupId),
-      new Promise((resolve) => setTimeout(() => resolve(null), 5000))
-    ]);
-  } catch (e) {
-    return null;
-  }
+      }
+
+      // Simpan grup ke registry. ID gratis dari remoteJid; nama grup diisi
+      // oleh refreshGroups() (punya subject), jadi di sini cukup pastikan ada.
+      try {
+        await Group.updateOne(
+          { _id: from },
+          { $set: { updatedAt: new Date() }, $setOnInsert: { _id: from } },
+          { upsert: true }
+        );
+      } catch (err) {
+        logEvent('whatsapp', 'group_upsert', 'Gagal simpan grup: ' + err.message, 'warn');
+      }
+    }
+  });
+
+  console.log('[WhatsAppBot] Inisialisasi Baileys selesai, menunggu koneksi...');
+  return sock;
 }
 
 /**
- * Setup CronJob untuk Broadcast Berita Harian via WhatsApp
- * @param {Client} client 
+ * Ambil semua grup yang diikuti langsung dari server WhatsApp (ringan, tanpa
+ * browser) dan simpan nama + ID-nya ke MongoDB. Baileys menyediakan ini native.
+ * @param {import('@whiskeysockets/baileys').WASocket} sock
+ * @returns {Promise<number>} jumlah grup yang tersimpan
  */
-function scheduleDailyBroadcast(client) {
-  const WA_GROUP_ID = process.env.WA_GROUP_ID;
+export async function refreshGroups(sock) {
+  const groups = await sock.groupFetchAllParticipating();
+  const entries = Object.values(groups || {});
+  await Promise.all(
+    entries.map((g) =>
+      Group.updateOne(
+        { _id: g.id },
+        { $set: { name: g.subject || '', updatedAt: new Date() }, $setOnInsert: { _id: g.id } },
+        { upsert: true }
+      )
+    )
+  );
+  logEvent('whatsapp', 'groups_refreshed', `Registry grup diperbarui: ${entries.length} grup.`);
+  return entries.length;
+}
 
+/**
+ * CronJob broadcast berita AI harian ke WA_GROUP_ID (jam 08:00 WIB).
+ * @param {import('@whiskeysockets/baileys').WASocket} sock
+ */
+function scheduleDailyBroadcast(sock) {
+  const WA_GROUP_ID = process.env.WA_GROUP_ID;
   if (!WA_GROUP_ID) {
-    console.warn('[WhatsAppBot] WA_GROUP_ID tidak ditemukan. Broadcast harian dinonaktifkan.');
+    console.warn('[WhatsAppBot] WA_GROUP_ID tidak ada. Broadcast harian dinonaktifkan.');
     return;
   }
 
-  console.log(`[WhatsAppBot] Cron Broadcast diaktifkan untuk grup: ${WA_GROUP_ID} (Jadwal: 08:00 WIB)`);
-
-  // Jadwal setiap jam 08:00 (Waktu Server / UTC biasanya, perlu disesuaikan jika ingin timezone tertentu)
-  // Untuk waktu Asia/Jakarta (WIB), asumsikan node-cron bisa set timezone
+  console.log(`[WhatsAppBot] Cron Broadcast aktif untuk grup: ${WA_GROUP_ID} (08:00 WIB)`);
   cron.schedule('0 8 * * *', async () => {
-    console.log('[WhatsAppBot] Cron Triggered: Memulai fetch berita AI untuk broadcast...');
+    console.log('[WhatsAppBot] Cron: fetch berita AI untuk broadcast...');
     try {
       const newsList = await getAINews(2);
-      
-      let newsMsg = '';
-      if (newsList.length > 0) {
-        newsMsg = newsList.map((n, i) => `*${i+1}. ${n.title}*\n_${n.description}_\n🔗 ${n.url}`).join('\n\n');
-      } else {
-        newsMsg = '⚠️ Tidak ada berita AI terbaru hari ini.';
-      }
-      
-      const greeting = `🤖 *Automated Hermes Broadcast*\nSelamat Pagi! Berikut ringkasan AI hari ini:\n\n`;
-      const finalMsg = greeting + newsMsg;
+      let newsMsg =
+        newsList.length > 0
+          ? newsList.map((n, i) => `*${i + 1}. ${n.title}*\n_${n.description}_\n🔗 ${n.url}`).join('\n\n')
+          : '⚠️ Tidak ada berita AI terbaru hari ini.';
 
-      await client.sendMessage(WA_GROUP_ID, finalMsg);
-      console.log('[WhatsAppBot] Broadcast Harian Berhasil Dikirim!');
+      const greeting = `🤖 *Automated Hermes Broadcast*\nSelamat Pagi! Berikut ringkasan AI hari ini:\n\n`;
+      await sock.sendMessage(WA_GROUP_ID, { text: greeting + newsMsg });
+      logEvent('whatsapp', 'broadcast', 'Broadcast harian terkirim.');
     } catch (error) {
-      console.error('[WhatsAppBot] Broadcast Gagal:', error.message);
+      logEvent('whatsapp', 'broadcast', 'Broadcast gagal: ' + error.message, 'error');
     }
-  }, {
-    scheduled: true,
-    timezone: "Asia/Jakarta"
-  });
+  }, { scheduled: true, timezone: 'Asia/Jakarta' });
 }
