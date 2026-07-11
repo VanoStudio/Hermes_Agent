@@ -60,10 +60,25 @@ export function startServer() {
     }
 
     try {
-      const chats = await client.getChats();
-      const groups = chats
-        .filter((chat) => chat.isGroup)
-        .map((chat) => ({ name: chat.name, id: chat.id._serialized }));
+      // Sengaja TIDAK pakai client.getChats() - fungsi itu memanggil
+      // groupMetadata.update() (request jaringan live ke server WhatsApp)
+      // untuk SETIAP grup, jadi bisa memakan waktu menit-an dan gampang
+      // timeout di CPU terbatas seperti Railway. Di sini kita cuma butuh
+      // nama + ID, jadi baca langsung dari Store yang sudah ada di memori
+      // tanpa memicu request tambahan apa pun - hasilnya instan.
+      const groups = await Promise.race([
+        client.pupPage.evaluate(() => {
+          const chats = window.require('WAWebCollections').Chat.getModelsArray();
+          return chats
+            .filter((chat) => !!chat.groupMetadata)
+            .map((chat) => ({
+              name: chat.name || chat.formattedTitle || chat.id.user,
+              id: chat.id._serialized
+            }));
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout 15 detik saat membaca Store WhatsApp Web')), 15000))
+      ]);
+
       res.json({ count: groups.length, groups });
     } catch (err) {
       res.status(500).json({ error: 'Gagal mengambil daftar grup: ' + err.message });
